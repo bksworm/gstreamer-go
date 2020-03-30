@@ -31,13 +31,12 @@ messageTimestamp(void *p)
 	return (GST_MESSAGE_TIMESTAMP(p));
 }
 
-void gstreamer_init();
 
 GstPipeline *gstreamer_create_pipeline(char *pipeline);
 
 void gstreamer_pipeline_start(GstPipeline *pipeline, int pipelineId);
 
-void gstreamer_pipeline_but_watch(GstPipeline *pipeline, int pipelineId);
+void gstreamer_pipeline_bus_watch(GstPipeline *pipeline, int pipelineId);
 
 void gstreamer_pipeline_pause(GstPipeline *pipeline);
 
@@ -66,5 +65,19 @@ void gstreamer_element_push_buffer(GstElement *element, void *buffer,int len);
 void gstreamer_element_push_buffer_timestamp(GstElement *element, void *buffer,int len, guint64 pts);
 
 void gstreamer_element_pull_buffer(GstElement *element, int elementId);
+
+//BooksWarm
+void goHandleErrorMessage(GstMessage* message, int pipelineId, GError *err, gchar *debug);
+void goHandlePushData(int elementId);
+void goHandleStopFeed(int elementId);
+void goHandleEnoughData(int elementId);
+void gstreamer_element_start_push_buffer(GstElement *element, int elementId) ;
+gboolean gst_push_buffer_async(GstElement *element, void *buffer, int len) ;
+GMainLoop* gstreamer_main_loop_new() ;
+char** gstreamer_init(int* argc, char** argv) ;
+
+//BooksWarm
+
+
 
 #endif

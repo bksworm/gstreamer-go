@@ -1,19 +1,32 @@
 package gstreamer
 
 /*
-#cgo pkg-config: gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 gstreamer-plugins-base-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-plugins-bad-1.0
+#cgo pkg-config: gstreamer-1.0 gstreamer-app-1.0
 #include "gstreamer.h"
 */
 import "C"
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"unsafe"
 )
 
-func init() {
-	C.gstreamer_init()
+func Init() {
+	alen := C.int(len(os.Args))
+	argv := make([]*C.char, alen)
+	for i, s := range os.Args {
+		argv[i] = C.CString(s)
+	}
+	ret := C.gstreamer_init(&alen, &argv[0])
+
+	argv = (*[1 << 16]*C.char)(unsafe.Pointer(ret))[:alen]
+	os.Args = make([]string, alen)
+	for i, s := range argv {
+		os.Args[i] = C.GoString(s)
+	}
 }
 
 type MessageType int
@@ -56,6 +69,14 @@ func (v *Message) GetTypeName() string {
 	return C.GoString(c)
 }
 
+func (v *Message) GetName() string {
+	s := C.gst_message_get_structure(v.native())
+	if s == nil {
+		return ""
+	}
+	return C.GoString((*C.char)(C.gst_structure_get_name(s)))
+}
+
 func gbool(b bool) C.gboolean {
 	if b {
 		return C.gboolean(1)
@@ -71,9 +92,9 @@ func gobool(b C.gboolean) bool {
 
 type Element struct {
 	element *C.GstElement
-	out     chan []byte
 	stop    bool
 	id      int
+	queue   chan *bytes.Buffer
 }
 
 type Pipeline struct {
@@ -109,7 +130,7 @@ func New(pipelineStr string) (*Pipeline, error) {
 
 func (p *Pipeline) PullMessage() <-chan *Message {
 	p.messages = make(chan *Message, 5)
-	C.gstreamer_pipeline_but_watch(p.pipeline, C.int(p.id))
+	C.gstreamer_pipeline_bus_watch(p.pipeline, C.int(p.id))
 	return p.messages
 }
 
@@ -191,21 +212,6 @@ func (e *Element) SetCap(cap string) {
 	C.gstreamer_set_caps(e.element, capStr)
 }
 
-func (e *Element) Push(buffer []byte) {
-
-	b := C.CBytes(buffer)
-	defer C.free(unsafe.Pointer(b))
-	C.gstreamer_element_push_buffer(e.element, b, C.int(len(buffer)))
-}
-
-func (e *Element) Poll() <-chan []byte {
-	if e.out == nil {
-		e.out = make(chan []byte, 10)
-		C.gstreamer_element_pull_buffer(e.element, C.int(e.id))
-	}
-	return e.out
-}
-
 func (e *Element) Stop() {
 	gstreamerLock.Lock()
 	delete(elements, e.id)
@@ -213,11 +219,10 @@ func (e *Element) Stop() {
 	if e.stop {
 		return
 	}
-	if e.out != nil {
+	if e.queue != nil {
 		e.stop = true
-		close(e.out)
+		close(e.queue)
 	}
-
 }
 
 //export goHandleSinkBuffer
@@ -225,12 +230,13 @@ func goHandleSinkBuffer(buffer unsafe.Pointer, bufferLen C.int, elementID C.int)
 	gstreamerLock.Lock()
 	defer gstreamerLock.Unlock()
 	if element, ok := elements[int(elementID)]; ok {
-		if element.out != nil && !element.stop {
-			element.out <- C.GoBytes(buffer, bufferLen)
+		if element.queue != nil && !element.stop {
+			element.queue <- bytes.NewBuffer(C.GoBytes(buffer, bufferLen))
 		}
 	} else {
 		fmt.Printf("discarding buffer, no element with id %d", int(elementID))
 	}
+	//frees memory allocated by gstreamer_new_sample_handler(gst_buffer_extract_dup)
 	C.free(buffer)
 }
 
@@ -239,9 +245,9 @@ func goHandleSinkEOS(elementID C.int) {
 	gstreamerLock.Lock()
 	defer gstreamerLock.Unlock()
 	if element, ok := elements[int(elementID)]; ok {
-		if element.out != nil && !element.stop {
+		if element.queue != nil && !element.stop {
 			element.stop = true
-			close(element.out)
+			close(element.queue)
 		}
 	}
 }
@@ -250,13 +256,18 @@ func goHandleSinkEOS(elementID C.int) {
 func goHandleBusMessage(message *C.GstMessage, pipelineId C.int) {
 	gstreamerLock.Lock()
 	defer gstreamerLock.Unlock()
+	id := int(pipelineId)
 	msg := &Message{GstMessage: message}
-	if pipeline, ok := pipelines[int(pipelineId)]; ok {
+	if pipeline, ok := pipelines[id]; ok {
 		if pipeline.messages != nil {
-			pipeline.messages <- msg
+			select {
+			case pipeline.messages <- msg:
+			default:
+				break
+			}
 		}
 	} else {
-		fmt.Printf("discarding message, no pipelie with id %d", int(pipelineId))
+		fmt.Printf("discarding message, no pipelie with id %d", id)
 	}
 
 }
@@ -284,4 +295,118 @@ func CheckPlugins(plugins []string) error {
 	}
 
 	return nil
+}
+
+func (e *Element) Poll() <-chan *bytes.Buffer {
+	if e.queue == nil {
+		e.queue = make(chan *bytes.Buffer, 100)
+		C.gstreamer_element_pull_buffer(e.element, C.int(e.id))
+	}
+	return e.queue
+}
+
+//BKSWORM ------------------------------------
+
+func (e *Element) Push(buffer []byte) {
+
+	b := C.CBytes(buffer)
+	defer C.free(unsafe.Pointer(b))
+	C.gstreamer_element_push_buffer(e.element, b, C.int(len(buffer)))
+}
+
+func (e *Element) PushBuffer() chan<- *bytes.Buffer {
+	if e.queue == nil {
+		e.queue = make(chan *bytes.Buffer, 10)
+	}
+	return e.queue
+}
+
+//appsrc can work in a variety of modes: in pull mode, it requests data from the
+//application every time it needs it. In push mode, the application pushes data
+//at its own pace. Furthermore, in push mode, the application can choose to be
+//blocked in the push function when enough data has already been provided,
+//or it can listen to the enough-data and need-data signals to control flow.
+//This example implements the latter approach. Information regarding the other
+// methods can be found in the appsrc documentation.
+func (e *Element) StartPush() {
+	C.gstreamer_element_start_push_buffer(e.element, C.int(e.id))
+}
+
+//Helper function for async pusher
+func (e *Element) PushAsync(buffer []byte) {
+
+	b := C.CBytes(buffer)
+	defer C.free(unsafe.Pointer(b))
+	//It pushes go buf to pipe line buffer is duped!
+	C.gst_push_buffer_async(e.element, b, C.int(len(buffer)))
+}
+
+func (e *Element) AsObj() unsafe.Pointer {
+	return unsafe.Pointer(e.element)
+}
+
+//export goHandleErrorMessage
+func goHandleErrorMessage(message *C.GstMessage, pipelineId C.int,
+	err *C.GError, debug *C.gchar) {
+	_, ok := pipelines[int(pipelineId)]
+	if ok {
+		em := C.GoString((*C.char)(err.message))
+		dbg := C.GoString((*C.char)(debug))
+		fmt.Println("Bus error", em, dbg)
+	}
+}
+
+//export goHandlePushData
+func goHandlePushData(elementID C.int) {
+	//Go Call back for "need-data" signal or push_data function
+	gstreamerLock.Lock()
+	defer gstreamerLock.Unlock()
+	element, ok := elements[int(elementID)]
+	if ok {
+		if element.queue != nil && element.stop == false {
+			buffer := <-element.queue
+			b := C.CBytes(buffer.Bytes())
+			defer C.free(unsafe.Pointer(b))
+			C.gst_push_buffer_async(element.element, b, C.int(buffer.Len()))
+		}
+	}
+}
+
+//export goHandleStopFeed
+func goHandleStopFeed(elementID C.int) {
+	gstreamerLock.Lock()
+	defer gstreamerLock.Unlock()
+	if element, ok := elements[int(elementID)]; ok {
+		if element.queue != nil && !element.stop {
+			element.stop = true
+			close(element.queue)
+		}
+	}
+}
+
+//export     goHandleEnoughData
+func goHandleEnoughData(elementID C.int) {
+
+}
+
+type MainLoop struct {
+	loop *C.GMainLoop
+}
+
+func NewMainLoop() (ml *MainLoop) {
+	ml = new(MainLoop)
+	ml.loop = C.gstreamer_main_loop_new()
+	return ml
+}
+
+func (ml *MainLoop) Run() {
+	C.g_main_loop_run(ml.loop)
+}
+
+func (ml *MainLoop) Quit() {
+	C.g_main_loop_quit(ml.loop)
+}
+
+func (ml *MainLoop) Close() {
+	C.g_main_loop_unref(ml.loop)
 }

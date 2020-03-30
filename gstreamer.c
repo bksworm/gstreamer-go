@@ -5,25 +5,16 @@
 #include <gst/gstcaps.h>
 
 
-
-void gstreamer_init() {
-    gst_init(NULL, NULL);
+char** gstreamer_init(int* argc, char** argv) {
+	gst_init(argc, &argv);
+	return argv;
 }
-
-
-	// MESSAGE_UNKNOWN       MessageType = C.GST_MESSAGE_UNKNOWN
-	// MESSAGE_EOS           MessageType = C.GST_MESSAGE_EOS
-	// MESSAGE_ERROR         MessageType = C.GST_MESSAGE_ERROR
-	// MESSAGE_TAG           MessageType = C.GST_MESSAGE_TAG
-	// MESSAGE_BUFFERING     MessageType = C.GST_MESSAGE_BUFFERING
-	// MESSAGE_STATE_CHANGED MessageType = C.GST_MESSAGE_STATE_CHANGED
-	// MESSAGE_ANY           MessageType = C.GST_MESSAGE_ANY
-
 
 typedef struct BusMessageUserData {
     int pipelineId;
 } BusMessageUserData;
 
+static void error_cb (GstBus *bus, GstMessage *msg, gpointer user_data) ;
 
 static gboolean gstreamer_bus_call(GstBus *bus, GstMessage *msg, gpointer user_data) {
 
@@ -31,31 +22,29 @@ static gboolean gstreamer_bus_call(GstBus *bus, GstMessage *msg, gpointer user_d
     int pipelineId = s->pipelineId;
 
     switch (GST_MESSAGE_TYPE(msg)) {
-    case GST_MESSAGE_EOS:
-        goHandleBusMessage(msg,pipelineId);
-        break;
-    case GST_MESSAGE_ERROR: {
-        gchar *debug;
-        GError *error;
-        gst_message_parse_error(msg, &error, &debug);
-        g_free(debug);
-        g_error_free(error);
-        goHandleBusMessage(msg,pipelineId);
-        break;
+        case GST_MESSAGE_EOS: {
+            goHandleBusMessage(msg,pipelineId);
+            break;
+        }
+        case GST_MESSAGE_ERROR: {
+            error_cb(bus, msg, user_data) ;
+            break;
+        }
+        
+        case GST_MESSAGE_BUFFERING: {
+            goHandleBusMessage(msg,pipelineId);
+            break;
+        }
+        case GST_MESSAGE_STATE_CHANGED: {
+            goHandleBusMessage(msg,pipelineId);
+            break;
+        }
+        
+        default: {
+            goHandleBusMessage(msg,pipelineId);
+            break;
+        }
     }
-    case GST_MESSAGE_BUFFERING: {
-        goHandleBusMessage(msg,pipelineId);
-        break;
-    }
-    case GST_MESSAGE_STATE_CHANGED: {
-        goHandleBusMessage(msg,pipelineId);
-        break;
-    }
-    
-    default:
-        break;
-    }
-
     return TRUE;
 }
 
@@ -71,13 +60,30 @@ void gstreamer_pipeline_start(GstPipeline *pipeline, int pipelineId) {
     gst_element_set_state(GST_ELEMENT(pipeline), GST_STATE_PLAYING);
 }
 
+// This function is called when an error message is posted on the bus
+static void error_cb (GstBus *bus, GstMessage *msg, gpointer user_data) {
+  GError *err;
+  gchar *debug_info;
+  BusMessageUserData *s = (BusMessageUserData *)user_data;
+  int pipelineId = s->pipelineId;
 
-void gstreamer_pipeline_but_watch(GstPipeline *pipeline, int pipelineId) {
+  /* Print error details on the screen */
+  gst_message_parse_error (msg, &err, &debug_info);
+  g_printerr ("Error received from element %s: %s\n", GST_OBJECT_NAME (msg->src), err->message);
+  g_printerr ("Debugging information: %s\n", debug_info ? debug_info : "none");
+  goHandleErrorMessage(msg, pipelineId, err, debug_info);
+  g_clear_error (&err);
+  g_free (debug_info);
+
+ }
+
+
+void gstreamer_pipeline_bus_watch(GstPipeline *pipeline, int pipelineId) {
     BusMessageUserData *s = calloc(1, sizeof(BusMessageUserData));
     s->pipelineId = pipelineId;
     GstBus *bus = gst_pipeline_get_bus(pipeline);
     gst_bus_add_watch(bus, gstreamer_bus_call, s);
-    gst_object_unref(bus);
+   gst_object_unref(bus);
 }
 
 void gstreamer_pipeline_pause(GstPipeline *pipeline) {
@@ -164,21 +170,31 @@ void gstreamer_element_push_buffer_timestamp(GstElement *element, void *buffer,i
 typedef struct SampleHandlerUserData {
     int elementId;
     GstElement *element;
+    int idleId ; //ID (greater than 0) of the event source. see g_idle_add() doc.
 } SampleHandlerUserData;
 
 
 GstFlowReturn gstreamer_new_sample_handler(GstElement *object, gpointer user_data) {
   GstSample *sample = NULL;
   GstBuffer *buffer = NULL;
-  gpointer copy = NULL;
+  gpointer copy = NULL; 
   gsize copy_size = 0;
   SampleHandlerUserData *s = (SampleHandlerUserData *)user_data;
 
   g_signal_emit_by_name (object, "pull-sample", &sample);
   if (sample) {
+    //the buffer of sample or NULL when there is no buffer. The buffer remains
+    // valid as long as sample is valid.
     buffer = gst_sample_get_buffer(sample);
     if (buffer) {
+      //Extracts a copy of at most size bytes the data at offset into a GBytes. 
+      //dest must be freed using g_free() when done.  
       gst_buffer_extract_dup(buffer, 0, gst_buffer_get_size(buffer), &copy, &copy_size);
+      //Uncomment if you need to know, what do you receive. 
+      //GstCaps * caps  = gst_sample_get_caps(sample) ;
+      //gchar* caps_str = gst_caps_to_string(caps); 
+      //g_print("%s\n", caps_str ) ;
+      //g_free(caps_str) ; 
       goHandleSinkBuffer(copy, copy_size, s->elementId);
     }
     gst_sample_unref (sample);
@@ -207,5 +223,94 @@ void gstreamer_element_pull_buffer(GstElement *element, int elementId) {
     g_signal_connect(element, "eos", G_CALLBACK(gstreamer_sink_eos_handler), s); 
 }
 
+//BooksWarm
 
+// This method is called by the idle GSource in the mainloop, to feed CHUNK_SIZE bytes into appsrc.
+// The idle handler is added to the mainloop when appsrc requests us to start sending data (need-data signal)
+// and is removed when appsrc has enough data (enough-data signal).
+// SEE: https://gstreamer.freedesktop.org/documentation/tutorials/basic/short-cutting-the-pipeline.html?gi-language=c
+static gboolean push_data(gpointer user_data) {
+        SampleHandlerUserData *s = (SampleHandlerUserData *)user_data;
+        g_print ("try to feed\n");
+        goHandlePushData(s->elementId);
+}
+
+// This signal callback triggers when appsrc needs data. Here, we add an idle handler
+//  to the mainloop to start pushing data into the appsrc 
+static void start_feed (GstElement *source, guint size, SampleHandlerUserData *data) {
+  if (data->idleId == 0) {
+    g_print ("Start feeding\n");
+    data->idleId = g_idle_add ((GSourceFunc) push_data, data);
+  }
+}
+
+// This callback triggers when appsrc has enough data and we can stop sending.
+// We remove the idle handler from the mainloop 
+static void stop_feed (GstElement *source, SampleHandlerUserData *data) {
+  if (data->idleId != 0) {
+    g_print ("Stop feeding\n");
+    goHandleStopFeed(data->elementId);
+    g_source_remove (data->idleId);
+    data->idleId = 0;
+  }
+}
+
+//Call back for "need-data" signal
+static void cb_need_data (GstElement *source, guint size, SampleHandlerUserData *data) {
+  //g_print("In %s\n", __func__);
+  goHandlePushData(data->elementId);
+}
+
+static void cb_enough_data(GstElement *src, SampleHandlerUserData *data)
+{
+    g_print("In %s\n", __func__);
+    goHandleEnoughData(data->elementId);
+}
+
+static gboolean cb_seek_data(GstElement *src, guint64 offset, SampleHandlerUserData *data)
+{
+    g_print("In %s\n", __func__);
+    return TRUE;
+}
+
+
+void gstreamer_element_start_push_buffer(GstElement *element, int elementId) {
+    gulong ret ;
+    SampleHandlerUserData *s = calloc(1, sizeof(SampleHandlerUserData));
+    s->element = element;
+    s->elementId = elementId;
+    
+    g_print ("Register push\n");
+    ret = g_signal_connect (element, "need-data", G_CALLBACK (cb_need_data), s);
+    if (ret == 0) {
+        g_print ("need-data is not connected\n");     
+    }
+
+    ret = g_signal_connect (element, "enough-data", G_CALLBACK (cb_enough_data), s);
+    if (ret == 0) {
+        g_print ("enough-data is not connected\n");     
+    }
+}
+
+// Function to push go buf to pipe line buffer is duped
+gboolean gst_push_buffer_async(GstElement *element, void *buffer,int len) {
+    GstFlowReturn ret;
+    gpointer p = g_memdup(buffer, len);
+    GstBuffer *data = gst_buffer_new_wrapped(p, len); //TODO: do we need to free it?
+
+    // Push the buffer into the appsrc
+    g_signal_emit_by_name (GST_APP_SRC(G_OBJECT(element)), "push-buffer", data, &ret);
+
+    if (ret != GST_FLOW_OK) {
+        // We got some error, stop sending data
+        g_print ("push async error\n");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+GMainLoop* gstreamer_main_loop_new(){
+	return g_main_loop_new(NULL, FALSE) ;
+}
 
